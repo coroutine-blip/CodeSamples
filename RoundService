@@ -1,0 +1,584 @@
+--!strict
+
+--// Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local ServerStorage = game:GetService("ServerStorage")
+
+--// Module Imports
+local Utilities = ReplicatedStorage.Utilities
+local Knit = require(Utilities.Packages.Knit)
+local Promise = require(Utilities.Promise)
+local Trove = require(Utilities.Trove)
+local Configurations = require(ServerScriptService.Modules.Configurations)
+
+--// States
+type CharacterData = {
+	Character: Model,
+	CharacterChildren: { Instance },
+	BackpackChildren: { Instance },
+}
+
+local DenyReasons = {
+	NoMapFound = "NoMap",
+	NoSpawnlocations = "NoSpawnlocations",
+	NotEnoughPlayers = "NotEnoughPlayers",
+}
+
+local Settings: {
+	RoundInProgress: boolean,
+	Sheriff: { [Player]: { isAlive: boolean, kills: number } },
+	Murderer: { [Player]: { isAlive: boolean, kills: number } },
+	Innocent: { [Player]: { isAlive: boolean, kills: number } },
+	DroppedGuns: { [string]: Vector3 },
+} = {
+	RoundInProgress = false,
+	Sheriff = {},
+	Murderer = {},
+	Innocent = {},
+	DroppedGuns = {},
+}
+
+--// Knit Init
+local RoundService = Knit.CreateService {
+	Name = "RoundService",
+	Client = {
+		RoundIsStarting = Knit.CreateSignal(),
+		RoundStarted = Knit.CreateSignal(),
+		RoundEnded = Knit.CreateSignal(),
+		SpecialTeamSignal = Knit.CreateSignal(),
+		SheriffDied = Knit.CreateSignal(),
+		RewardSignal = Knit.CreateSignal()
+	},
+}
+
+--// Helper functions
+local function GetCharacterAndBackpackChildren(Player: Player): CharacterData | boolean
+	local Character = Player.Character
+	if not Character then return false end
+
+	local Backpack = Player.Backpack
+	if not Backpack then return false end
+
+	return {
+		Character = Character,
+		CharacterChildren = Character:GetChildren(),
+		BackpackChildren = Backpack:GetChildren(),
+	}
+end
+
+local function RetrieveRandomTeam(): string
+	local Teams_and_Chances: { [string]: number } = Configurations.Default.TEAMS_INFO.Chances
+	local totalChances = 0
+
+	for _, Chance: number in Teams_and_Chances do
+		totalChances += Chance
+	end
+
+	local randomChance = math.random() * totalChances
+	local currentChance = 0
+
+	for teamName, Chance in Teams_and_Chances do
+		currentChance += Chance
+		if randomChance <= currentChance then
+			return teamName
+		end
+	end
+
+	return "Innocent"
+end
+
+local function CountTeams(Team, checkIsAlive: boolean?): number
+	local n = 0
+	for _, Values in Settings[Team] do
+		if checkIsAlive then
+			if Values.isAlive then n += 1 end
+			continue
+		end
+		n += 1
+	end
+	return n
+end
+
+local function CheckTeamAvailability(): string | nil
+	local limit_for_murderer = Configurations.Default.TEAMS_INFO.Limits.Murderer
+	local limit_for_sheriff = Configurations.Default.TEAMS_INFO.Limits.Sheriff
+
+	local amount_of_murderers = CountTeams("Murderer")
+	local amount_of_sheriffs = CountTeams("Sheriff")
+
+	if amount_of_murderers < limit_for_murderer then
+		return "Murderer"
+	elseif amount_of_sheriffs < limit_for_sheriff then
+		return "Sheriff"
+	end
+
+	return nil
+end
+
+local function RetrieveAndPositionMap(mapName: string): boolean
+	if not ServerStorage.Maps:FindFirstChild(mapName) then
+		return false
+	end
+
+	local clonedMap: Model = ServerStorage.Maps:FindFirstChild(mapName):Clone()
+	clonedMap:PivotTo(CFrame.new(70.45, 0.5, 1296.17))
+
+	workspace.Map:ClearAllChildren()
+	clonedMap.Parent = workspace.Map
+	return true
+end
+
+-- End match helpers
+local function SendRewardSignal(Player: Player, informationTable, service)
+	service.Client.RewardSignal:Fire(Player, informationTable)
+end
+
+local function SendEndSignal(winState)
+	local RoundService = Knit.GetService("RoundService")
+
+	local information = {
+		Sheriffs = {} :: { [number]: { isAlive: boolean, kills: number } },
+		Murderers = {} :: { [number]: { isAlive: boolean, kills: number } },
+		winState = winState,
+	}
+
+	for Player, Values in Settings.Sheriff do
+		information.Sheriffs[Player.UserId] = {
+			isAlive = Values.isAlive,
+			kills = Values.kills,
+		}
+	end
+
+	for Player, Values in Settings.Murderer do
+		information.Murderers[Player.UserId] = {
+			isAlive = Values.isAlive,
+			kills = Values.kills,
+		}
+	end
+
+	RoundService.Client.RoundEnded:FireAll(information)
+end
+
+local function GetLobbySpawn(): Vector3
+	local Spawnlocations = workspace.Lobby:FindFirstChild("Spawns") :: Model
+	local Spawns: {} = Spawnlocations:GetChildren()
+	local randomIndex = math.random(1, #Spawns)
+
+	local spawn = Spawns[randomIndex]
+	return spawn.Position + Vector3.new(0, 3, 0)
+end
+
+local function HandleRewards(condition: string)
+	local RoundService = Knit.GetService("RoundService")
+	local rewardsTable = Configurations.Default.Rewards
+	local survivalCoinsAmount = rewardsTable.Survival
+	local hasWonCoinsAmount = rewardsTable.HasWon
+	local perKillCoinsAmount = rewardsTable.Per_kill
+	local hasParticipatedCoinsAmount = rewardsTable.hasParticipated
+
+	local coinsToEarn: { [Player]: number } = {}
+
+	local function ApplyRewards(teamTable, conditionCheck)
+		for Player, Values in teamTable do
+			if not Player.Parent then warn("nah") continue end
+			
+			local tableToSend = table.create(3) :: {}
+			local coins = hasParticipatedCoinsAmount
+			tableToSend["HasParticipated"] = hasParticipatedCoinsAmount
+			
+			if Values.isAlive then 
+				coins += survivalCoinsAmount 
+				tableToSend["SurvivedAmount"] = survivalCoinsAmount
+			end
+			if Values.kills ~= 0 then 
+				local value = Values.kills * perKillCoinsAmount
+				coins += value
+				tableToSend["ForKills"] = value
+			end
+			if condition == conditionCheck then 
+				coins += hasWonCoinsAmount
+				tableToSend["HasWon"] = hasWonCoinsAmount
+			end
+				
+			coinsToEarn[Player] = coins
+			SendRewardSignal(Player, tableToSend, RoundService)
+		end
+	end
+
+	ApplyRewards(Settings.Sheriff, "SheriffsWin")
+	ApplyRewards(Settings.Murderer, "MurderersWin")
+	ApplyRewards(Settings.Innocent, "InnocentsWin")
+
+	for Player, Coins in coinsToEarn do
+		if Player.Parent then
+			local leaderstats = Player:FindFirstChild("leaderstats")
+			local Cash = leaderstats:FindFirstChild("Cash") :: NumberValue
+			Cash.Value += Coins
+		end
+	end
+end
+
+local function TakeWeapons(Team: string, Service)
+	if not Settings[Team] then return end
+
+	for Player: Player, Values in Settings[Team] do
+		if Player.Parent ~= Players then continue end
+
+		local CharacterData = GetCharacterAndBackpackChildren(Player)
+		if typeof(CharacterData) == "boolean" then continue end
+
+		local Character = CharacterData.Character
+		local backpackChildren = CharacterData.BackpackChildren
+		local characterChildren = CharacterData.CharacterChildren
+
+		for _, Instance in backpackChildren do
+			if not Instance:IsA("Tool") or Instance:GetAttribute("Toy") then continue end
+			Service:TakeOutGear(Player, Instance)
+		end
+
+		for _, Instance in characterChildren do
+			if not Instance:IsA("Tool") or Instance:GetAttribute("Toy") then continue end
+			Service:TakeOutGear(Player, Instance)
+		end
+
+		local HRP = Character.PrimaryPart
+		if HRP then HRP.Position = GetLobbySpawn() end
+	end
+end
+
+local function DropSheriffsWeapon(Player: Player, RoundService)
+	local Char = Player.Character
+	if not Char then return end
+
+	local HRP = Char.PrimaryPart
+	if not HRP then return end
+
+	local diedPosition = HRP.Position
+	Settings.DroppedGuns[Player.Name] = diedPosition
+
+	RoundService.Client.SheriffDied:FireAll(diedPosition)
+end
+
+--// Client methods
+function RoundService.Client:PickDroppedUpGun(Player, DeadSheriffsName)
+	local diedPosition = Settings.DroppedGuns[DeadSheriffsName]
+	if not diedPosition then error(false) end
+
+	local Char = Player.Character
+	if not Char then error(false) end
+
+	local HRP = Char.PrimaryPart
+	if not HRP then error(false) end
+
+	local DIFFERENCE_TOLERANCE = 1
+	if (HRP.Position - diedPosition).Magnitude > DIFFERENCE_TOLERANCE then error(false) end
+
+	local InventoryService = Knit.GetService("InventoryService")
+	InventoryService:HandOutWeapon(Player, "EquippedGunSkin")
+end
+
+--// Helper knit methods
+function RoundService:IsPlayerInTeam(Player, Team, CheckIsAlive: boolean?): boolean
+	local teamData = Settings[Team]
+	if not teamData or not teamData[Player] then return false end
+
+	if CheckIsAlive and teamData[Player].isAlive == false then
+		return false
+	end
+
+	return true
+end
+
+function RoundService:AddToKillCount(Player, Team, Amount)
+	local teamData = Settings[Team]
+	if not teamData then return end
+
+	local playerData = teamData[Player]
+	if not playerData then return end
+
+	if playerData.Kills then
+		playerData.Kills += 1
+	end
+end
+
+local function HandlePlayerDeath(Player: Player, Trove: Trove.Trove)
+	return Promise.new(function(Resolve, Reject)
+		local Character = Player.Character or Player.CharacterAdded:Wait()
+		if not Character then Reject() end
+
+		local Humanoid = Character:FindFirstChildOfClass("Humanoid") :: Humanoid
+		if not Humanoid then Reject() end
+
+		Trove:Add(Humanoid.Died:Connect(Resolve))
+		Trove:Add(Players.PlayerRemoving:Connect(function(leavingPlayer)
+			if leavingPlayer == Player then Resolve() end
+		end))
+	end)
+end
+
+--// Service Methods
+function RoundService:HandoutGears()
+	return Promise.new(function(resolve)
+		local weaponsConfig = {
+			Sheriff = { DataType = "EquippedGunSkin", TeamName = "Sheriff" },
+			Murderer = { DataType = "EquippedKnifeSkin", TeamName = "Murderer" },
+		}
+
+		for _, player: Player in Players:GetPlayers() do
+			local teamName
+			if Settings.Sheriff[player] then
+				teamName = "Sheriff"
+			elseif Settings.Murderer[player] then
+				teamName = "Murderer"
+			end
+
+			if teamName then
+				local InventoryService = Knit.GetService("InventoryService")
+				local dataType = weaponsConfig[teamName].DataType
+				InventoryService:HandOutWeapon(player, dataType)
+			end
+		end
+
+		resolve()
+	end)
+end
+
+function RoundService:EndRound()
+	return Promise.new(function(resolve)
+		local aliveCount = { Murderer = 0, Innocent = 0, Sheriff = 0 }
+
+		for player, data in Settings.Sheriff do
+			if player.Parent and data.isAlive then aliveCount.Sheriff += 1 end
+		end
+
+		for player, data in Settings.Murderer do
+			if player.Parent and data.isAlive then aliveCount.Murderer += 1 end
+		end
+
+		for player, data in Settings.Innocent do
+			if player.Parent and data.isAlive then aliveCount.Innocent += 1 end
+		end
+
+		local winConditions = {
+			InnocentsWin = { Murderer = 0, Innocent = nil, Sheriff = nil },
+			MurderersWin = { Murderer = nil, Innocent = 0, Sheriff = 0 },
+			SheriffsWin  = { Murderer = 0, Innocent = 0, Sheriff = nil },
+			Draw = { Murderer = nil, Innocent = nil, Sheriff = nil },
+		}
+
+		for conditionName, condition in winConditions do
+			local matches = true
+
+			for team, requiredCount in condition do
+				if requiredCount ~= nil and aliveCount[team] ~= requiredCount then
+					matches = false
+					break
+				end
+			end
+
+			if matches then
+				local InventoryService = Knit.GetService("InventoryService")
+				for _, teamName in { "Sheriff", "Murderer", "Innocent" } do
+					TakeWeapons(teamName, InventoryService)
+				end
+
+				resolve(conditionName)
+				return
+			end
+		end
+	end)
+end
+
+function RoundService:HandleRoundProgress()
+	local IntermissionService = Knit.GetService("IntermissionService")
+	local trovesTable = table.create(#Players:GetPlayers()) :: { [number]: Trove.Trove }
+
+	Promise.race({
+		Promise.new(function(resolve)
+			for Sheriff, Values in Settings.Sheriff do
+				local actionTrove = Trove.new()
+
+				HandlePlayerDeath(Sheriff, actionTrove)
+					:andThen(function()
+						Values.isAlive = false
+						
+						local aliveSheriffs = CountTeams("Sheriff", true)
+						local aliveInnocents = CountTeams("Innocent", true)
+						
+						if aliveSheriffs > 0 or aliveInnocents > 0 then
+							DropSheriffsWeapon(Sheriff, self)
+						else
+							warn(Settings)
+							resolve()
+						end
+					end)
+					:catch(resolve)
+
+				table.insert(trovesTable, actionTrove)
+			end
+
+			for Murderer, Values in Settings.Murderer do
+				local actionTrove = Trove.new()
+
+				HandlePlayerDeath(Murderer, actionTrove)
+					:andThen(function()
+						Values.isAlive = false
+						
+						if CountTeams("Murderer", true) == 0 then 
+							resolve() 
+						end
+					end)
+					:catch(resolve)
+
+				table.insert(trovesTable, actionTrove)
+			end
+
+			for Innocent, Values in Settings.Innocent do
+				local actionTrove = Trove.new()
+
+				HandlePlayerDeath(Innocent, actionTrove)
+					:andThen(function()
+						Values.isAlive = false
+						
+						local aliveInnocents = CountTeams("Innocent", true)
+						local aliveMurderers = CountTeams("Murderer", true)
+						local aliveSheriffs = CountTeams("Sheriff", true)
+						
+						if aliveInnocents == 0 and 
+							(aliveMurderers == 0 or aliveSheriffs == 0) then
+							resolve()
+						end
+					end)
+					:catch(function() Settings.Innocent[Innocent] = nil end)
+
+				table.insert(trovesTable, actionTrove)
+			end
+		end),
+
+		Promise.delay(Configurations.Default.ROUND_TIME):andThen(function() return "RoundEndedSuccesfully" end),
+	})
+		:andThen(function()
+			task.delay(1.5, function()
+				self:EndRound():andThen(function(condition)
+					for _, T in trovesTable do
+						T:Destroy()
+					end
+
+					HandleRewards(condition)
+					SendEndSignal(condition)
+					table.clear(trovesTable)
+					table.clear(Settings.Sheriff)
+					table.clear(Settings.Murderer)
+					table.clear(Settings.Innocent)
+					table.clear(Settings.DroppedGuns)
+
+					Settings.RoundInProgress = false
+					IntermissionService:RoundSuccesfullyEnded()
+				end)
+			end)
+		end)
+end
+
+
+function RoundService:StartRoundPreparations(chosenMap: string)
+	return Promise.new(function(resolve, reject)
+		if Settings.RoundInProgress then
+			reject()
+		end
+
+		Settings.RoundInProgress = true
+		table.clear(Settings.Sheriff)
+		table.clear(Settings.Murderer)
+		table.clear(Settings.Innocent)
+
+		local players = Players:GetPlayers()
+		local playerCount = #players
+		local roundTrove = Trove.new()
+
+		roundTrove:Add(Players.PlayerRemoving:Connect(function()
+			playerCount -= 1
+			if playerCount < Configurations.Default.MIN_START_AMOUNT then
+				reject()
+			end
+		end))
+
+		--// Team Assignment
+		for index, player: Player in ipairs(players) do
+			if not player.Parent then continue end
+
+			local chosenTeam: string
+			local totalPlayers = #players
+
+			if index > totalPlayers - 2 then
+				chosenTeam = CheckTeamAvailability() or "Innocent"
+			else
+				chosenTeam = "Innocent"
+			end
+
+			self.Client.SpecialTeamSignal:Fire(player, chosenTeam)
+			Settings[chosenTeam][player] = { isAlive = true, kills = 0 }
+		end
+
+		--// Map Loading
+		local success = RetrieveAndPositionMap(chosenMap)
+		if not success then
+			roundTrove:Destroy()
+			reject()
+		end
+
+		self.Client.RoundIsStarting:FireAll()
+		roundTrove:Destroy()
+		resolve()
+	end)
+end
+
+
+function RoundService:StartRound()
+	return Promise.new(function(resolve, reject)
+		local map = workspace.Map:GetChildren()[1]
+		if not map then reject(DenyReasons.NoMapFound) end
+
+		local teamLimits = Configurations.Default.TEAMS_INFO.Limits
+		local murdererCount = CountTeams("Murderer")
+		local sheriffCount = CountTeams("Sheriff")
+
+		--// Ensure minimum players per team
+		if murdererCount < teamLimits.Murderer or sheriffCount < teamLimits.Sheriff then
+			reject(DenyReasons.NotEnoughPlayers)
+		end
+
+		local spawnsFolder = map:FindFirstChild("Spawns") :: Model
+		if not spawnsFolder then reject(DenyReasons.NoSpawnlocations) end
+
+		local spawns = spawnsFolder:GetChildren()
+		local spawnIndex = 1
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			if not spawns[spawnIndex] then
+				spawnIndex = 1
+			end
+
+			local character = player.Character or player.CharacterAdded:Wait()
+			local hrp = character:WaitForChild("HumanoidRootPart")
+			local spawn = spawns[spawnIndex]
+			local spawnPos = spawn.Position + Vector3.new(0, 3, 0)
+
+			character:PivotTo(CFrame.new(spawnPos))
+			spawnIndex += 1
+		end
+
+		--// Delay to allow players to settle before round logic begins
+		Promise.delay(5):andThen(function()
+			self:HandoutGears()
+				:andThen(function()
+					self:HandleRoundProgress()
+					self.Client.RoundStarted:FireAll()
+				end)
+			resolve()
+		end)
+	end)
+end
+
+return RoundService
