@@ -1,0 +1,203 @@
+--!strict
+--// Services
+local ContextActionService = game:GetService("ContextActionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--// Module Imports
+local Util = script.Util
+local Trove = require(Util.Trove)
+local AnimationSystemService = require(Util.AnimationSystemService)
+local AnimationsDatabase = require(Util.AnimationsDatabase)
+local HelperCAS = require(Util.HelperCAS)
+
+--// Types
+export type KeyActionMap = {
+	[Enum.KeyCode]: (Enum.UserInputState, InputObject) -> (),
+	onEquip: (() -> ())?,
+	onUnequip: (() -> ())?
+}
+
+export type CASConfiguration = {
+	Items: {[string]: {KeyActionMap: KeyActionMap, Trove: Trove.Trove, Class: any}},
+	BoundActions: {[string]: boolean},
+	_cleanupConn: RBXScriptConnection,
+	animSystem: AnimationSystemService.ConfiguredAnimSystem
+}
+
+--// Main Module
+local CustomActionService = {}
+CustomActionService.__index = CustomActionService
+
+type CAS = typeof(setmetatable({} :: CASConfiguration, CustomActionService))
+
+
+--// Helper Functions
+local function wrapActionFunction(func: (Enum.UserInputState, InputObject) -> ()): (string, Enum.UserInputState, InputObject) -> ()
+	return function(_, inputState, inputObject)
+		func(inputState, inputObject)
+	end
+end
+
+local function bindItemFunctions(tool: Tool, actions: KeyActionMap, boundRegistry: {[string]: boolean})
+	local index = 0
+	for key, func in actions do
+		if typeof(key) ~= "EnumItem" then
+			continue
+		end
+		
+		index += 1
+		local actionName = `{tool.Name}_Action_{index}`
+
+		if not boundRegistry[actionName] then
+			ContextActionService:BindAction(actionName, wrapActionFunction(func), false, key)
+			boundRegistry[actionName] = true
+		end
+	end
+end
+
+local function UnbindItemFunctions(self, itemName: string)
+	local actions = self.Items[itemName].KeyActionMap
+	if not actions then
+		return false
+	end
+
+	-- Unbind all related actions
+	local index = 0
+	for _ in actions do
+		index += 1
+		local actionName = `{itemName}_Action_{index}`
+		if self.BoundActions[actionName] then
+			ContextActionService:UnbindAction(actionName)
+			self.BoundActions[actionName] = nil
+		end
+	end
+	
+	return true
+end
+
+local function GetAnimation(Type, Name)
+	local animdata = AnimationsDatabase[Type] and AnimationsDatabase[Type][Name]
+	if not animdata then return AnimationsDatabase[Type] end
+	
+	return animdata
+end
+
+local function BindItemDestruction(Tool: Tool, self: CAS, itemTrove: Trove.Trove)
+	itemTrove:Add(Tool.AncestryChanged:Connect(function(_, parent)
+		if parent == nil then
+			local itemName = Tool.Name
+			local itemData = self.Items[itemName]
+
+			if itemData and itemData.Class and itemData.Class.Destroy then
+				itemData.Class.Destroy()
+			end
+
+			self:RemoveItem(itemName)
+			self.animSystem:UnRegisterAnimationSet(itemName)
+		end
+	end))
+end
+
+--// Constructor
+function CustomActionService.New(): CAS
+	local self = setmetatable({} :: CASConfiguration, CustomActionService)
+	self.Items = {}
+	self.BoundActions = {}
+	self.animSystem = AnimationSystemService.New()
+	self._cleanupConn = Players.LocalPlayer.CharacterAdded:Connect(function()
+		self:RemoveAllItems()
+	end)
+
+	return self
+end
+
+--// Public Methods
+function CustomActionService:AddItem(Tool: Tool): boolean
+	if not Tool:IsA("Tool") then
+		return false
+	end
+
+	--// Get function to retrieve functions for tool & assign animations to animSystem
+	local itemName = Tool.Name
+	local itemType = Tool:GetAttribute("Type")
+	local success, dictionary = HelperCAS.FindItem(itemType, itemName)
+	if not success or not dictionary then return false end
+		
+	-- Get any animations for the tool
+	local itemTrove = Trove.new()
+	local animations = GetAnimation(itemType, itemName)
+	if animations then
+		self.animSystem:RegisterSet(itemName, animations)
+		self.animSystem:StopAnimationsWhenMoving(itemName)
+	end
+	
+	--// Retrieve Functions for items.
+	local itemFunctions 
+	if typeof(dictionary) == "function" then
+		itemFunctions = dictionary(Tool, self.animSystem)
+	else
+		itemFunctions = dictionary.Functions(Tool, self.animSystem, self)
+	end
+	
+	itemTrove:Add(Tool.Equipped:Connect(function()
+		if itemFunctions.onEquip then 
+			itemFunctions.onEquip() 
+		end
+		
+		-- Bind functions
+		bindItemFunctions(Tool, itemFunctions, self.BoundActions)
+	end))
+	
+	itemTrove:Add(Tool.Unequipped:Connect(function()
+		if itemFunctions.onUnequip then 
+			itemFunctions.onUnequip() 
+		end
+		
+		-- Stop any animations
+		self.animSystem:StopAll(itemName)
+		
+		-- Unbind functions
+		UnbindItemFunctions(self, itemName)
+	end))
+
+	if not self.Items then self.Items = {} end
+	self.Items[itemName] = {
+		Tool = Tool,
+		KeyActionMap = itemFunctions,
+		Trove = itemTrove,
+	}
+	
+	BindItemDestruction(Tool, self, itemTrove)
+	return true
+end
+
+function CustomActionService:RemoveItem(itemName: string): boolean
+	local actions = self.Items[itemName]
+	if not actions then
+		return false
+	end
+
+	-- Unbind all related actions
+	UnbindItemFunctions(self, itemName)
+	
+	self.Items[itemName] = nil
+	return true
+end
+
+function CustomActionService:RemoveAllItems()
+	for itemName, _ in self.Items do
+		if typeof(itemName) == "string" then
+			UnbindItemFunctions(self, itemName)
+		end
+	end
+end
+
+function CustomActionService:RegisterToolClass(itemName, Class: ModuleScript)
+	if not self.Items[itemName] then return end
+	if not self.Items[itemName].Class then
+		self.Items[itemName].Class = Class
+	end
+end
+
+return CustomActionService
