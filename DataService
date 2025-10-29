@@ -1,0 +1,167 @@
+--!strict
+--// Services
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local DataStoreService = game:GetService("DataStoreService")
+
+--// Module Imports
+local Utilities = ReplicatedStorage.Utilities
+local Knit = require(Utilities.Packages.Knit)
+local Promise = require(Utilities.Promise)
+local TroveModule = require(Utilities.Trove)
+local ProfileService = require(ServerScriptService.Modules.ProfileService)
+
+--// Data Template
+local PlayerDataTemplate = {
+	Cash = 250,
+	Kills = 0 :: number,
+	Tools = {["NormalGun"] = {Quantity = 0},["NormalKnife"] = {Quantity = 0}} :: {[string]: {Quantity: number}},
+	Gamepasses = {} :: {[number]: string},
+	EquippedGunSkin = "NormalGun",
+	EquippedKnifeSkin = "NormalKnife",
+}
+
+--// Profile Store
+local PlayerProfileStore = ProfileService.GetProfileStore("PlayerData", PlayerDataTemplate)
+
+--// States
+local PlayerProfiles = {}
+local SaveQueue: {[Player]: {[string]: any}} = {}
+
+--// Knit Initializer
+local DataService = Knit.CreateService {Name = "DataService"}
+
+--// Helper functions
+local function loadGamepassesProducts(productName, Player: Player)
+	local profile = PlayerProfiles[Player]
+	if not profile then return end
+
+	local gamepasses: {[number]: string} = profile.Gamepasses
+	if #gamepasses == 0 then return end
+
+	local Services = ServerScriptService.Services
+	local GamepassDatabase = require(Services.GamepassService.InternalGamepassDatabase)
+
+	local gamepassFunction = GamepassDatabase.Gamepasses[productName]
+	if gamepassFunction then gamepassFunction(Player, false) end
+end
+
+local function CreateLeaderstats(player: Player, profile)
+	local Leaderstats: Folder = Instance.new("Folder")
+	Leaderstats.Name = "leaderstats"
+	Leaderstats.Parent = player
+
+	local Cash: NumberValue = Instance.new("NumberValue")
+	Cash.Value = profile.Data.Cash
+	Cash.Name = "Cash"
+	Cash.Parent = Leaderstats
+
+	local Kills: NumberValue = Instance.new("NumberValue")
+	Kills.Value = profile.Data.Kills
+	Kills.Name = "Kills"
+	Kills.Parent = Leaderstats
+
+	Cash:GetPropertyChangedSignal("Value"):Connect(function()
+		local newValue = Cash.Value
+		PlayerProfiles[player].Data.Cash = newValue
+	end)
+
+	Kills:GetPropertyChangedSignal("Value"):Connect(function()
+		local newValue = Kills.Value
+		PlayerProfiles[player].Data.Kills = newValue
+	end)
+end
+
+local function LoadGamepasses(Player: Player, Profile)
+	local gamepassData = Profile.Data.Gamepasses
+	if #gamepassData == 0 then return end
+	for _, productName in gamepassData do
+		loadGamepassesProducts(Player, productName)
+	end
+end
+
+--// Knit Functions
+function DataService:RetrieveData(player: Player)
+	local key = "Player_" .. player.UserId
+	local profile = PlayerProfileStore:LoadProfileAsync(key, "ForceLoad")
+
+	if not profile then
+		player:Kick("Failed to load data.")
+		return
+	end
+
+	profile:AddUserId(player.UserId)
+	profile:Reconcile()
+
+	PlayerProfiles[player] = profile
+	CreateLeaderstats(player, profile)
+	LoadGamepasses(player, profile)
+end
+
+function DataService:SaveData(Player: Player, Key, Value: any, Insert: boolean?)
+	local profile = PlayerProfiles[Player]
+	if not profile then return false end
+	
+	if Insert then
+		table.insert(profile.Data[Key], Value)
+		return 
+	end
+	
+	profile.Data[Key] = Value
+end
+
+function DataService:GetData(player: Player, target: string)
+	local profile = PlayerProfiles[player]
+	if not profile then return false end
+	return profile.Data[target]
+end
+
+function DataService:QueueDataChange(player: Player, key: string, value: any)
+	if not PlayerProfiles[player] then return end
+	if not SaveQueue[player] then SaveQueue[player] = {} end
+	SaveQueue[player][key] = value
+end
+
+local function FinishQueue(player: Player)
+	if not PlayerProfiles[player] or not SaveQueue[player] then return end
+
+	for key, value in SaveQueue[player] do
+		PlayerProfiles[player].Data[key] = value
+	end
+
+	SaveQueue[player] = {} 
+end
+
+
+--// Knit Lifecycle
+function DataService:KnitInit()
+	Players.PlayerAdded:Connect(function(player)
+		self:RetrieveData(player)
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		local profile = PlayerProfiles[player]
+		if not profile then return end
+
+		task.delay(1, function()
+			if profile:IsActive() then
+				FinishQueue(player)
+				profile:Release()
+			end
+
+			PlayerProfiles[player] = nil
+			SaveQueue[player] = nil
+		end)
+	end)
+
+	game:BindToClose(function()
+		for player, profile in PlayerProfiles do
+			FinishQueue(player)
+			profile:Release()
+		end
+	end)
+end
+
+return DataService
