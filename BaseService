@@ -1,0 +1,496 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Knit = require(ReplicatedStorage.Packages.Knit)
+local PromiseModule = require(ReplicatedStorage.Util.PromiseModule)
+local GoodSignal = require(ReplicatedStorage.Util.GoodSignal)
+local TroveModule = require(ReplicatedStorage.Util.TroveModule)
+local ZonePlus = require(ReplicatedStorage.Util.Zone)
+local DataModule = require(ServerScriptService.Modules.DataModule)
+
+local ServerSignals = require(ServerScriptService.Modules.ServerSignals)
+local BrainrotDatabase = require(ReplicatedStorage.Dictionary.BrainrotsDB)
+
+local Bases = workspace.Map.Bases
+local BaseData: {[Player]: {Base: Model, Brainrots_In_Base: {[Model]: {Platform: Model, Brainrot: Model, LastRedeemed: number, BeingStolen: boolean}}, 
+	LockedInformation: {isLocked: boolean, lastLocked: number}}} = {}
+
+local AvailableBases: {Model} = {Bases.Base1, Bases.Base2, Bases.Base3}
+
+local MAX_STEAL_DISTANCE = 5
+local CancelStealOperation = GoodSignal.new()
+
+
+local BaseService = Knit.CreateService{
+	Name = "BaseService",
+	Client = {
+		BaseSetup = Knit.CreateSignal(),
+		BaseLocked = Knit.CreateSignal(),
+		NewBrainrotAdded = Knit.CreateSignal(), -- One client signal,
+		BrainrotSell = Knit.CreateSignal(),
+		
+		--// Stolen Signals
+		BrainrotStolen = Knit.CreateSignal(), -- Fired to robber, and victim
+		--[[Will take As first arg: Action, Stolen brainrot.]]
+	}
+}
+
+--// Helper Functions
+local function AchorBodyparts(Model: Model)
+	for _, Descendents in Model:GetDescendants() do
+		if Descendents:IsA("BasePart") == false then continue end
+		Descendents.Anchored = true
+	end
+end
+
+local function RecoverBrainrotByName(Name: string): (boolean | {})
+	for _, Brainrots in BrainrotDatabase do
+		for BrainrotName, Value in Brainrots do
+			if BrainrotName == Name then
+				return Value
+			end
+		end
+	end
+end
+
+local function LoadBaseBrainrots(Player: Player, BrainrotsName: {string})	
+	local Data = BaseData[Player]
+	local Base = Data.Base
+	local Platforms: Model = Base:FindFirstChild("Platforms")
+	if not Platforms then return false end
+
+	PromiseModule.new(function(resolve, reject)
+		local trove = TroveModule.new()
+		trove:Add(Players.PlayerRemoving:Connect(function(leavingPlayer)
+			if leavingPlayer == Player then return reject(trove) end
+		end))
+
+		local LoadedBrainrots: {[Model]: {Platform: Model, Brainrot: Model, LastRedeemed: number}} = {Platforms = {}}
+
+		for _, Name in ipairs(BrainrotsName) do
+			BaseService:AddBrainrotToBase(Name, Player)
+		end
+		return resolve(trove, LoadedBrainrots)
+	end)
+		:catch(function(trove) warn(trove) trove:Destroy() return end)
+		:andThen(function(trove, LoadedBrainrots) trove:Destroy() return LoadedBrainrots end)
+end
+
+
+local function LockBase(Owner: Player, BaseData)
+	local Base = BaseData.Base
+	local leaveTrove = TroveModule.new()
+
+	PromiseModule.race({
+		PromiseModule.new(function(resolve)
+			leaveTrove:Add(Players.PlayerRemoving:Connect(function(leavingPlayer)
+				if leavingPlayer == Owner then
+					resolve({Action = "PlayerLeft", Trove = leaveTrove})
+				end
+			end))
+		
+			BaseService.Client.BaseLocked:FireAll(Base)
+		end),
+
+		PromiseModule.delay(30):andThen(function()
+			return {Action = "Timeout", Trove = leaveTrove}
+		end)
+	}):andThen(function(Args)
+		local Action = Args.Action
+		Args.Trove:Destroy()
+
+		if Action == "Timeout" then
+			return "Timeout"
+		end
+	end)
+end
+
+local function HandleStealOutcome(Outcome, Robber, Victim, Brainrot)	
+	--// Get Service
+	local BaseService = Knit.GetService("BaseService")
+	
+	--// Check outcomes
+	if Outcome == "Failed" then
+		local VictimData = BaseData[Victim]
+		local Platform: Model = VictimData.Brainrots_In_Base[Brainrot].Platform
+		local Stand: BasePart = Platform.Stand
+		
+		Brainrot:PivotTo(Stand.CFrame)
+		Brainrot.Parent = Stand
+		task.defer(function()
+			for _, Child in Brainrot:GetChildren() do
+				if Child:IsA("BasePart") then
+					Child.CanCollide = false
+				end
+			end
+		end)
+		
+		if Victim.Parent then
+			BaseService.Client.BrainrotStolen:Fire(Victim, {Action = "BrainrotRecovered", StolenBrainrot = Brainrot})
+		end
+	
+		if Robber.Parent then 
+			BaseService.Client.BrainrotStolen:Fire(Robber, {Action = "StealingFailed", StolenBrainrot = Brainrot})
+		end
+	end
+	
+	if Outcome == "Success" then
+		local VictimData = BaseData[Victim] 
+		local brainrotName = Brainrot.Name
+		
+		VictimData.Brainrots_In_Base[Brainrot] = nil
+		Brainrot:Destroy()
+		
+		local Platform = BaseService:AddBrainrotToBase(Robber, brainrotName)
+		
+		BaseService.Client.BrainrotStolen:Fire(Robber, {Action = "BrainrotSuccesfullyStolen", StolenBrainrot = Brainrot, Platform = Platform})
+		BaseService.Client.BrainrotStolen:Fire(Victim, {Action = "BrainrotStolenFromBase", StolenBrainrot = Brainrot})
+	end
+end
+
+--// Public Methods
+function BaseService.Client:GetBasesInformation()
+	local Templates: {[Model]: {Platforms: {Platform: Model, Brainrot: Model}}} = {}
+
+	for _, Value in BaseData do
+		Templates[Value.Base] = Templates[Value.Base] or {Platforms = {}}
+
+		for _, v in Value.Brainrots_In_Base do
+			table.insert(Templates[Value.Base].Platforms, {
+				Platform = v.Platform,
+				Brainrot = v.Brainrot
+			})
+		end
+	end
+end
+
+function BaseService:GetBaseData(Player)
+	return BaseData[Player] or false
+end
+
+function BaseService:AssignBase(Player: Player)
+	local DataService = Knit.GetService("DataService")
+	local randomIndex: number = math.random(1, #AvailableBases)
+	local randomBase = table.remove(AvailableBases, randomIndex)
+	local retrievedBrainrots = DataService:GetData(Player, "Brainrots_In_Base")
+
+	BaseData[Player] = {
+		Base = randomBase,
+		Brainrots_In_Base = {},
+		LockedInformation = {isLocked = false, lastLocked = 0}		
+	}
+
+	local Brainrots
+	if #retrievedBrainrots > 0 then
+		Brainrots = LoadBaseBrainrots(Player, retrievedBrainrots)
+	end
+
+	local SignGui = randomBase.Sign.SignPart.SignGui
+	SignGui.SignLabel.Text = `{Player.Name}'s Base`
+
+	ServerSignals.BaseRequestPlayerData:Fire(Player)
+	BaseService.Client.BaseSetup:Fire(Player, BaseData[Player].Base, Brainrots)
+end
+
+function BaseService:AddBrainrotToBase(BrainrotName: string, Player: Player)
+	local PlayerBaseData = BaseData[Player]
+	if not PlayerBaseData then return false end
+
+	local Platforms: Model = PlayerBaseData.Base:FindFirstChild("Platforms")
+	if not Platforms then return false end
+
+	local brainrotValues = RecoverBrainrotByName(BrainrotName)
+	if typeof(brainrotValues) == "boolean" then return end
+
+	for _, Platform: Model in Platforms:GetChildren() do
+		if not Platform.Stand:FindFirstChildOfClass("Model") then
+			local Stand: BasePart = Platform.Stand
+			local clonedBrainrot: Model = brainrotValues.Model:Clone()
+			AchorBodyparts(clonedBrainrot)
+			clonedBrainrot:PivotTo(Stand.CFrame)
+			clonedBrainrot.Parent = workspace
+			clonedBrainrot.Parent = Stand
+
+			PlayerBaseData.Brainrots_In_Base[clonedBrainrot] = {
+				Brainrot = clonedBrainrot,
+				Platform = Platform,
+				LastRedeemed = os.time()
+			}
+			
+			BaseService.Client.NewBrainrotAdded:Fire(Player, clonedBrainrot, Platform)
+			return Platform, clonedBrainrot
+		end
+	end
+end
+
+--// Auxiliary function that will handle creating zone for player's base, and returning the result.
+function BaseService:HandleStolenBrainrot(Robber: Player, Victim: Player, Brainrot: Model)
+	local Data = BaseData[Robber]
+	if not Data then
+		return false
+	end
+
+	local Trove = TroveModule.new()
+	local cancelConn
+	local zoneConn
+
+	return PromiseModule.race({
+		PromiseModule.new(function(Resolve, Reject)
+			--// Bind signal
+			cancelConn = CancelStealOperation:Connect(function()
+				Resolve({
+					Action = "Failed",
+					Conns = {cancelConn, zoneConn},
+					Trove = Trove
+				})
+			end)
+
+			--// Create Zone
+			local Detect_Part: Part = Data.Base.WallLock:Clone()
+			Detect_Part.Name = "Detect_Part"
+			Detect_Part.Size += Vector3.new(53.34, 0, 0)
+			Detect_Part.Parent = Data.Base
+
+			local Zone = ZonePlus.new(Detect_Part)
+			Trove:Add(Detect_Part)
+			Trove:Add(Zone)
+
+			zoneConn = Zone.playerEntered:Connect(function(player)
+				if player == Robber then
+					Resolve({
+						Action = "Success",
+						Conns = {cancelConn, zoneConn},
+						Trove = Trove
+					})
+				end
+			end)
+		end),
+
+		PromiseModule.delay(30):andThen(function()
+			return {
+				Action = "Failed",
+				Conns = {cancelConn, zoneConn},
+				Trove = Trove
+			}
+		end)
+	})
+end
+
+
+--// Client Methods
+function BaseService.Client:StealBrainrot(Player: Player, Victim: Player, Brainrot: Model)
+	if not Brainrot:IsA("Model") then return false end
+	if workspace.AvailableBrainrots[Brainrot] then return false end -- Check if brainrot is a roaming one (not stealable)
+
+	--// Check if brainrot exists within victim's base.
+	local VictimData = BaseData[Victim]
+	if not VictimData then
+		return false
+	end
+
+	local BrainrotData = VictimData.Brainrots_In_Base[Brainrot]
+	if not BrainrotData or BrainrotData.BeingStolen then return false end
+
+	--// Get player's character and do magnitude check
+	local Char = Player.Character
+	if not Char then return false end
+
+	local brainrotRootPart = Brainrot:FindFirstChild("HumanoidRootPart")
+	local HRP: BasePart = Char:FindFirstChild("HumanoidRootPart")
+	if not HRP or not brainrotRootPart then return false end
+
+	local Distance = (HRP.Position - brainrotRootPart.Position).Magnitude
+	if Distance > MAX_STEAL_DISTANCE then return false end
+
+	BrainrotData.BeingStolen = true
+
+	--// Create Trove for function
+	local Trove = TroveModule.new()
+
+	PromiseModule.race({
+		PromiseModule.new(function(Resolve, Reject)
+			-- Create attachment on brainrot
+			local brainrotAttachment = Instance.new("Attachment")
+			brainrotAttachment.Parent = Brainrot.PrimaryPart
+			Trove:Add(brainrotAttachment)
+
+			-- Create a target attachment
+			local targetAttachment = Instance.new("Attachment")
+			targetAttachment.Parent = workspace.Terrain
+			targetAttachment.Position = Brainrot.PrimaryPart.Position
+			Trove:Add(targetAttachment)
+
+			-- AlignPosition
+			local ap = Instance.new("AlignPosition")
+			ap.Attachment0 = brainrotAttachment
+			ap.Attachment1 = targetAttachment
+			ap.MaxForce = math.huge
+			ap.Responsiveness = 200
+			ap.RigidityEnabled = false
+			ap.Parent = Brainrot.PrimaryPart
+			Trove:Add(ap)
+
+			-- AlignOrientation
+			local ao = Instance.new("AlignOrientation")
+			ao.Attachment0 = brainrotAttachment
+			ao.CFrame = HRP.CFrame
+			ao.Responsiveness = 1000
+			ao.RigidityEnabled = false
+			ao.Mode = Enum.OrientationAlignmentMode.OneAttachment
+			ao.Parent = Brainrot.PrimaryPart
+			Trove:Add(ao)
+
+			local followDistance = 5
+
+			--// Signal Binding
+			local hitConn
+
+			hitConn = ServerSignals.PlayerHit:Connect(function(hitPlayer: Player)
+				if hitPlayer == Player then
+					Resolve({
+						Action = "Failed",
+						Trove = Trove,
+						Conns = {hitConn}
+					})
+				end
+			end)
+		
+			Trove:Add(Players.PlayerRemoving:Connect(function(LeavingPlayer)
+				if LeavingPlayer == Player then
+					Resolve({
+						Action = "Failed",
+						Trove = Trove,
+						Conns = {hitConn}
+					})
+				elseif LeavingPlayer == Victim then
+					Resolve({
+						Action = "Success",
+						Trove = Trove,
+						Conns = {hitConn}
+					})
+				end
+			end))
+			
+			Trove:Add(Player.CharacterAdded:Connect(function()
+				Resolve({
+					Action = "Failed",
+					Trove = Trove,
+					Conns = {hitConn}
+				})
+			end))
+
+			Trove:Add(RunService.Heartbeat:Connect(function()
+				if HRP and HRP.Parent then
+					targetAttachment.Position = HRP.Position - (HRP.CFrame.LookVector * followDistance)
+					ao.CFrame = HRP.CFrame
+				end
+			end))
+			
+			--// Fire Signal to both robber and victim.
+			BaseService.Client.BrainrotStolen:Fire(Player, {Action = "StealBrainrot"})
+			BaseService.Client.BrainrotStolen:Fire(Victim, {Action = "BrainrotStolen", StolenBrainrot = Brainrot})
+		end),
+	
+		--// Initiate Auxiliary function.
+		BaseService:HandleStolenBrainrot(Player, Victim, Brainrot):andThen(function(Args)
+			if Args then return Args end
+		end)
+	})
+		:andThen(function(Arguments)
+			for _, Connection: RBXScriptConnection in Arguments.Conns do
+				Connection:Disconnect()
+			end
+		
+			Trove:Destroy()
+			if Arguments.Trove then 
+				Arguments.Trove:Destroy()
+			end
+			
+			
+			HandleStealOutcome(Arguments.Action, Player, Victim, Brainrot)
+		end)
+end
+
+function BaseService.Client:LockBase(Player: Player): boolean
+	local BaseData = BaseData[Player]
+	if not BaseData then return false end
+
+	local LockedInformation = BaseData.LockedInformation
+	if LockedInformation.isLocked then return false end
+
+	local Cooldown = 30
+	local lastLocked = LockedInformation.lastLocked
+	local timeNow = os.time()
+
+	if (timeNow - lastLocked) < Cooldown then return false end
+
+	LockedInformation.isLocked = true
+	LockedInformation.lastLocked = timeNow
+	LockBase(Player, BaseData)
+	return true
+end
+
+
+function BaseService.Client:RedeemMoney(Player: Player, Brainrot: Model): boolean
+	if Brainrot:IsA("Model") == false then return false end
+
+	local BaseData = BaseData[Player]
+	if not BaseData then return false end	
+
+	if not BaseData.Brainrots_In_Base[Brainrot] then return false end
+
+	local Type = Brainrot:GetAttribute("Type")
+	if Type == nil then return false end
+
+	local BrainrotData = BrainrotDatabase[Type][Brainrot.Name]
+	local LastRedeemed: number = BaseData.Brainrots_In_Base[Brainrot].LastRedeemed
+	local TimeNow = os.time()
+
+	local multiplier = (TimeNow - LastRedeemed)
+	if multiplier < 1 then return false end
+
+	local result = BrainrotData.Money_Per_Second * multiplier
+	local Coins = Player.leaderstats.Coins
+	Coins.Value += result
+
+	BaseData.Brainrots_In_Base[Brainrot].LastRedeemed = TimeNow
+end
+
+--// Knit Start
+function BaseService:KnitInit()
+	Players.PlayerRemoving:Connect(function(Player)
+		local Key = Player.UserId
+		local Brainrots_In_Base = BaseData[Player].Brainrots_In_Base
+		local Brainrot_Names = {}
+		
+		task.spawn(function()
+			if Brainrots_In_Base then
+				for Model, Values in Brainrots_In_Base do
+					print(Model, Values)
+					table.insert(Brainrot_Names, Model.Name)
+				end
+			end
+			
+			DataModule.SaveAsync(Key, {
+				Key = Key,
+				Coins = Player.leaderstats.Coins.Value,
+				Brainrots_In_Base = Brainrot_Names
+			})
+		end)
+	end)
+end
+
+
+function BaseService:KnitStart()
+	ServerSignals.DataForPlayerSetUP:Connect(function(Player)
+		BaseService:AssignBase(Player)
+	end)
+
+	ServerSignals.BrainrotBeingStolen:Connect(function(Robber, Victim, Brainrot)
+		BaseService:HandleStolenBrainrot(Robber, Victim, Brainrot)
+	end)
+end
+
+return BaseService
