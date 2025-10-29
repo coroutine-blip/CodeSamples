@@ -1,0 +1,393 @@
+--!strict
+--// Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+--// Module Imports
+local Promise = require(ReplicatedStorage.Utilities.Promise)
+local Knit = require(ReplicatedStorage.Utilities.Packages.Knit)
+local GoodSignal = require(ReplicatedStorage.Utilities.Signal)
+local Trove = require(ReplicatedStorage.Utilities.Trove)
+
+--// States
+local CurrentTradeRequests: {[number]: {Requester: Player, Recipient: Player}} = {}
+local CurrentLobbies: {[number]: {
+	Owner: {Player: Player, isReady: boolean}, 
+	Member: {Player: Player, isReady: boolean}, 
+	FinalizingTrade: boolean,
+	LobbyID: number, 
+	Items: {[Player]: {[string]: number}}},
+} = {}
+local LobbyResponseSignal = GoodSignal.new() -- Used to track whether a player accepted an invitation or not
+
+--// Knit
+local TradeService = Knit.CreateService {
+	Name = "TradeService",
+	Client = {
+		TradeRequested = Knit.CreateSignal(),
+		TradeLobbyDeleted = Knit.CreateSignal(),
+		LobbyInitiated = Knit.CreateSignal(),
+		ItemAdded = Knit.CreateSignal(),
+		ItemQuantityDecreased = Knit.CreateSignal(),
+		PlayerReady = Knit.CreateSignal()
+	}
+}
+
+--// Helper Functions
+local function CleanData(LobbyID)
+	if CurrentLobbies[LobbyID] then CurrentLobbies[LobbyID] = nil end
+end
+
+local function GetCorrectPlayerRank(Player, lobbyid): boolean | {isReady: boolean}
+	local data = CurrentLobbies[lobbyid]
+	if not data then return false end
+	
+	if data.Owner.Player == Player then
+		return data.Owner
+	else
+		return data.Member
+	end
+end
+
+local function GetCorrectPlayer(playerToIgnore: Player, lobbyid): Player | boolean
+	local data = CurrentLobbies[lobbyid]
+	if not data then return false end
+
+	if data.Owner.Player ~= playerToIgnore then
+		return data.Owner.Player
+	else
+		return data.Member.Player
+	end	
+end
+
+local function HandoutItems(LobbyID, TradeService)
+	local lobby = CurrentLobbies[LobbyID]
+	if not lobby then return end
+
+	local InventoryService = Knit.GetService("InventoryService")
+	local owner = lobby.Owner.Player
+	local member = lobby.Member.Player
+	local items = lobby.Items
+	
+	local ownerItems = items[owner]
+	local memberItems = items[member]
+
+	--// Ensure both have valid offer tables
+	if not ownerItems and not memberItems then
+		return
+	end
+
+	--// Remove offered items from both parties
+	if ownerItems then
+		for itemName, quantity in ownerItems do
+			InventoryService:DecreaseItemAmount(owner, itemName, quantity)
+		end
+	end
+	
+	if memberItems then
+		for itemName, quantity in memberItems do
+			InventoryService:DecreaseItemAmount(member, itemName, quantity)
+		end
+	end
+
+	--// Add the other player’s items
+	if ownerItems then
+		for itemName, quantity in ownerItems do
+			InventoryService:AddItemToData(member, itemName, quantity)
+		end
+	end
+	
+	if memberItems then
+		for itemName, quantity in memberItems do
+			InventoryService:AddItemToData(owner, itemName, quantity)
+		end
+	end
+	
+	TradeService.Client.TradeLobbyDeleted:Fire(owner)
+	TradeService.Client.TradeLobbyDeleted:Fire(member)
+	CleanData(LobbyID)
+end
+
+local function CheckIfAllAreReady(LobbyID)
+	local lobbyData = CurrentLobbies[LobbyID]
+	if not lobbyData then return end
+
+	if lobbyData.Owner.isReady and lobbyData.Member.isReady then
+		return true
+	end
+	return false
+end
+
+local function countNumberOfRequests(): number
+	local n = 0
+	for _, _ in CurrentTradeRequests do
+		n+=1
+	end
+	return n
+end
+
+local function IsPlayerInLobby(Player: Player, LobbyID: number?): (boolean, {Owner: Player, Member: Player, LobbyID: number}?)
+	if LobbyID and CurrentLobbies[LobbyID] then
+		local lobby = CurrentLobbies[LobbyID]
+		if lobby.Owner.Player == Player or lobby.Member.Player == Player then return true end
+		return false
+	end
+
+	for _, Properties in CurrentLobbies do
+		if Properties.Member.Player == Player or Properties.Owner.Player == Player then
+			return true
+		end
+	end
+	return false
+end
+
+--// Service functions
+function TradeService:FinalizeTradeDeal(LobbyID)
+	local lobbyData = CurrentLobbies[LobbyID]
+	if not lobbyData then return end
+
+	local isMemberReady = (lobbyData.Member.isReady == true)
+	local isOwnerReady = (lobbyData.Owner.isReady == true)
+
+	if not isMemberReady or not isOwnerReady then warn(isMemberReady, isOwnerReady) return end
+	if lobbyData.FinalizingTrade then return end
+
+	local actionTrove = Trove.new()
+
+	Promise.new(function(Resolve, reject)
+		Promise.race({
+			Promise.new(function(resolve)
+				actionTrove:Add(Players.PlayerRemoving:Connect(function(player: Player)  
+					if player == lobbyData.Member.Player or player == lobbyData.Owner.Player then
+						return resolve(false)
+					end
+				end))
+			end),
+
+			Promise.delay(3):andThen(function()
+				lobbyData.FinalizingTrade = true
+				return true
+			end)
+		}):andThen(function(Successful: boolean)
+			if Successful == false then reject() end
+			task.delay(3, function() Resolve() end)
+		end)
+	end)
+		:andThen(function()
+			if lobbyData.Member.Player.Parent and lobbyData.Owner.Player.Parent then
+				print("Handing out items")
+				HandoutItems(LobbyID, self)
+			else
+				CleanData(LobbyID)
+			end
+		end)
+		:catch(function()
+			CleanData(LobbyID)
+		end)
+end
+
+function TradeService:ProcessTradeRequest(requester, targetPlayer, uniqueID)
+	local actionTrove = Trove.new()
+	local connection
+
+	Promise.race({
+		Promise.new(function(resolve)
+			--// Leave connections
+			actionTrove:Add(Players.PlayerRemoving:Connect(function(leavingPlayer)
+				if leavingPlayer == requester or leavingPlayer == targetPlayer then
+					if connection then connection:Disconnect() end
+					return resolve(false)
+				end
+			end))	
+
+			--// Accepted, denied connection
+			connection = LobbyResponseSignal:Connect(function(PlayerWhoAccepted: Player, State: boolean)
+				if PlayerWhoAccepted == targetPlayer then 
+					connection:Disconnect() 
+					return resolve(State) 
+				end
+			end)
+		end),
+
+		Promise.delay(10):andThen(function() connection:Disconnect() return false end)
+	}):andThen(function(accepted)
+		if accepted then 
+			local lobbyID = #CurrentLobbies + 1
+			CurrentLobbies[lobbyID] = {
+				Owner = {Player = requester, isReady = false},
+				Member = {Player = targetPlayer, isReady = false},
+				LobbyID = lobbyID,
+				Items = {},
+				FinalizingTrade = false
+			}
+
+			TradeService.Client.LobbyInitiated:Fire(requester, CurrentLobbies[lobbyID])
+			TradeService.Client.LobbyInitiated:Fire(targetPlayer, CurrentLobbies[lobbyID])
+		end
+
+		if connection then connection:Disconnect() end
+		if CurrentTradeRequests[uniqueID] then CurrentTradeRequests[uniqueID] = nil end
+		actionTrove:Destroy()
+	end)
+end
+
+--// Client functions
+function TradeService.Client:RequestTradeWithUser(Requester: Player, Target: Player)
+	if not Players:FindFirstChild(Target.Name) then
+		error(false)
+	end
+
+	local isRequesterInLobby: boolean = IsPlayerInLobby(Requester)
+	if isRequesterInLobby then
+		error(false)
+	end
+
+	--// Prevent duplicate requests between the same players
+	for _, requestData in CurrentTradeRequests do
+		if requestData.Requester == Requester and requestData.Recipient == Target then
+			error(false)
+		end
+	end
+
+	local UniqueID = countNumberOfRequests() + 1
+	CurrentTradeRequests[UniqueID] = {Requester = Requester, Recipient = Target}
+
+	TradeService.Client.TradeRequested:Fire(Target, UniqueID, Requester)
+	TradeService:ProcessTradeRequest(Requester, Target, UniqueID)
+
+	return UniqueID
+end
+
+function TradeService.Client:LeaveLobby(Player: Player, LobbyID: number)
+	local lobbyData = CurrentLobbies[LobbyID]
+	if not lobbyData then return end
+
+	if not IsPlayerInLobby(Player, lobbyData.LobbyID) then
+		error(false)
+	end
+
+	TradeService.Client.TradeLobbyDeleted:Fire(lobbyData.Owner.Player)
+	TradeService.Client.TradeLobbyDeleted:Fire(lobbyData.Member.Player)
+	CurrentLobbies[LobbyID] = nil
+	return true
+end
+
+function TradeService.Client:AddItem(Player, Item, LobbyID)
+	print(Item, LobbyID)
+	if typeof(Item) ~= "string" or typeof(LobbyID) ~= "number" then
+		error(false)
+	end
+
+	if not IsPlayerInLobby(Player, LobbyID) then
+		error(false)
+	end
+
+	local lobbyData = CurrentLobbies[LobbyID]
+	if not lobbyData then
+		error(false)
+	end
+
+	local InventoryService = Knit.GetService("InventoryService")
+
+	if not InventoryService:CheckIfPlayerHasItem(Player, Item) then
+		error(false)
+	end
+
+	if not InventoryService:CanTradeItem(Player, Item) then
+		error(false)
+	end
+
+	if not lobbyData.Items[Player] then
+		lobbyData.Items[Player] = {}
+	end
+
+	if not lobbyData.Items[Player][Item] then
+		lobbyData.Items[Player][Item] = 0
+	end
+
+	lobbyData.Items[Player][Item] += 1
+
+	local otherMember = GetCorrectPlayer(Player, LobbyID)
+	TradeService.Client.ItemAdded:Fire(otherMember, Player, Item)
+	return true
+end
+
+function TradeService.Client:DecreaseItemAmountClient(Player, Item, LobbyID)
+	-- Parameter validation
+	if typeof(Item) ~= "string" or typeof(LobbyID) ~= "number" then
+		error(false)
+	end
+
+	if not IsPlayerInLobby(Player, LobbyID) then error(false) end
+
+	local lobbyData = CurrentLobbies[LobbyID]
+	if not lobbyData then error(false) end
+
+	local InventoryService = Knit.GetService("InventoryService")
+	if not InventoryService:CheckIfPlayerHasItem(Player, Item) then
+		error(false)
+	end
+
+	if not lobbyData.Items[Player] or not lobbyData.Items[Player][Item] then
+		error(false)
+	end
+
+	-- Decrease trade count
+	lobbyData.Items[Player][Item] -= 1
+	InventoryService:DecreaseTradeCheckCount(Player, Item)
+
+	-- Remove the item entry completely if depleted
+	if lobbyData.Items[Player][Item] <= 0 then
+		lobbyData.Items[Player][Item] = nil
+	end
+
+	local otherMember = GetCorrectPlayer(Player, LobbyID)
+	TradeService.Client.ItemQuantityDecreased:Fire(otherMember, Player, Item)
+	return true
+end
+
+function TradeService.Client:ReadyUp(Player, LobbyID)
+	if typeof(LobbyID) ~= "number" then error(false) end
+	
+	local lobbydata = CurrentLobbies[LobbyID]
+	if not IsPlayerInLobby(Player, LobbyID) then error(false) end
+	
+	local rank = GetCorrectPlayerRank(Player, LobbyID)
+	if typeof(rank) == "boolean" then error(false) end
+	
+	if rank.isReady == true then error(false) end
+	rank.isReady = true
+	
+	local otherMember = GetCorrectPlayer(Player, LobbyID)
+	if otherMember then TradeService.Client.PlayerReady:Fire(otherMember, Player, true) end
+	
+	if CheckIfAllAreReady(LobbyID) then TradeService:FinalizeTradeDeal(LobbyID) end
+	
+	return true
+end
+
+function TradeService.Client:Unready(Player, LobbyID)
+	local lobbydata = CurrentLobbies[LobbyID]
+	if not IsPlayerInLobby(Player, LobbyID) then error(false) end
+	
+	if lobbydata.FinalizingTrade then error(false) end
+	
+	local rank = GetCorrectPlayerRank(Player, LobbyID)
+	if typeof(rank) == "boolean" then error(false) end
+	
+	if rank.isReady == false then error(false) end
+	rank.isReady = false
+	
+	local otherMember = GetCorrectPlayer(Player, LobbyID)
+	if otherMember then TradeService.Client.PlayerReady:Fire(otherMember, Player, false) end
+	
+	return true
+end
+
+function TradeService.Client:RespondToLobbyInvite(Player: Player, UniqueID: number, State: boolean)
+	if not CurrentTradeRequests[UniqueID] then return end
+	LobbyResponseSignal:Fire(Player, State)
+end
+
+return TradeService
