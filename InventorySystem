@@ -1,0 +1,246 @@
+--!strict
+--// Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--// Module Imports
+local Utilities = ReplicatedStorage:WaitForChild("Utilities")
+local Knit = require(Utilities.Packages.Knit)
+local Promise = require(Utilities.Promise)
+local Trove = require(Utilities.Trove)
+
+--// Types
+type PlayerInventory = {
+	EquippedGunSkin: string,
+	EquippedKnifeSkin: string,
+	Items: { [string]: { Quantity: number } }
+}
+
+--// States
+local PlayerItemsTable: { [Player]: PlayerInventory } = {}
+local TradeCheckCount: { [Player]: { [string]: number } } = {}
+local ReadyPlayers: { Player } = {}
+
+local DenyReasons = {
+	AlreadyHasItemEquipped = "You already have this item equipped!",
+	ItemNotFound = "Item not found in your inventory.",
+}
+
+--// Knit Service
+local InventoryService = Knit.CreateService({
+	Name = "InventoryService",
+	Client = {
+		ItemAdded = Knit.CreateSignal(),
+		ItemRemoved = Knit.CreateSignal(),
+		InventoryItemDecreased = Knit.CreateSignal(),
+		InventoryItemIncreased = Knit.CreateSignal(),
+		InventoryInformationSignal = Knit.CreateSignal(),
+	},
+})
+
+--// Helpers
+local function GetDataService()
+	return Knit.GetService("DataService")
+end
+
+local function EnsurePlayerData(player: Player): PlayerInventory
+	if not PlayerItemsTable[player] then
+		local DataService = GetDataService()
+		PlayerItemsTable[player] = {
+			EquippedGunSkin = DataService:GetData(player, "EquippedGunSkin"),
+			EquippedKnifeSkin = DataService:GetData(player, "EquippedKnifeSkin"),
+			Items = DataService:GetData(player, "Tools") or {},
+		}
+	end
+	return PlayerItemsTable[player]
+end
+
+local function SendInformationToPlayer(player: Player)
+	local data = PlayerItemsTable[player]
+	if not data then return end
+	InventoryService.Client.InventoryInformationSignal:Fire(player, data)
+end
+
+local function GetTool(name: string): Tool?
+	local folder = ReplicatedStorage:FindFirstChild("Tools")
+	if not folder then return nil end
+	return folder:FindFirstChild(name) :: Tool?
+end
+
+--// Inventory Core
+function InventoryService:CanTradeItem(player: Player, item: string): boolean
+	local data = EnsurePlayerData(player)
+	local itemData = data.Items[item]
+	if not itemData then return false end
+
+	TradeCheckCount[player] = TradeCheckCount[player] or {}
+	local count = TradeCheckCount[player][item] or 0
+
+	if count >= itemData.Quantity then
+		return false
+	end
+
+	TradeCheckCount[player][item] = count + 1
+	return true
+end
+
+function InventoryService:DecreaseTradeCheckCount(player: Player, item: string, amountToRemove: number?): boolean
+	local checks = TradeCheckCount[player]
+	if not checks or not checks[item] then return false end
+
+	local removeAmount = amountToRemove or 1
+	if removeAmount <= 0 then return false end
+
+	checks[item] -= removeAmount
+	if checks[item] <= 0 then
+		checks[item] = nil
+	end
+
+	return true
+end
+
+function InventoryService:DecreaseItemAmount(player: Player, item: string, amountToRemove: number?): boolean
+	local data = EnsurePlayerData(player)
+	local itemData = data.Items[item]
+	if not itemData then error(false)end
+
+	local removeAmount = amountToRemove or 1
+	if removeAmount <= 0 or itemData.Quantity < removeAmount then
+		error(false)
+	end
+
+	itemData.Quantity -= removeAmount
+	InventoryService.Client.InventoryItemDecreased:Fire(player, item, itemData.Quantity)
+	
+	if itemData.Quantity <= 0 then
+		data.Items[item] = nil
+		if TradeCheckCount[player] then
+			TradeCheckCount[player][item] = nil
+		end
+	end
+
+	GetDataService():QueueDataChange(player, "Tools", data.Items)
+	return true
+end
+
+function InventoryService:CheckIfPlayerHasItem(player: Player, item: string): boolean
+	local data = EnsurePlayerData(player)
+	return data.Items[item] ~= nil
+end
+
+function InventoryService:AddItemToData(player: Player, item: string, quantity: number?)
+	local data = EnsurePlayerData(player)
+	local existingItem = data.Items[item]
+
+	local quantityToAdd = quantity or (existingItem and existingItem.Quantity + 1) or 1
+
+	if existingItem then
+		existingItem.Quantity = quantityToAdd
+	else
+		data.Items[item] = { Quantity = quantityToAdd }
+	end
+
+	InventoryService.Client.InventoryItemIncreased:Fire(player, item, quantityToAdd)
+	GetDataService():QueueDataChange(player, "Tools", data.Items)
+end
+
+--// Tool Handling
+function InventoryService:TakeOutGear(player: Player, gear: Tool?, gearName: string?)
+	if not player or not player.Parent then return end
+
+	local backpack = player:FindFirstChild("Backpack")
+	local char = player.Character
+	if not backpack or not char then return end
+
+	local tool = gear or backpack:FindFirstChild(gearName) or char:FindFirstChild(gearName)
+	if not tool then return end
+
+	tool:Destroy()
+	self.Client.ItemRemoved:Fire(player, tool.Name)
+end
+
+function InventoryService:HandOutWeapon(player: Player, dataType: string)
+	local data = EnsurePlayerData(player)
+	local equippedItem = data[dataType]
+	if not equippedItem then return end
+
+	local tool = GetTool(equippedItem)
+	if not tool then
+		return
+	end
+
+	local cloned = tool:Clone()
+	cloned.Parent = player.Backpack
+
+	task.delay(0.5, function() 
+		self.Client.ItemAdded:Fire(player, cloned)
+	end)
+end
+
+function InventoryService:AddToolToPlayer(Player: Player, item: string, Fire: boolean?)
+	local toolToClone: Tool? = GetTool(item)
+	if not toolToClone then warn("tool not found", item) return end
+	
+	local tool = toolToClone:Clone()
+	tool.Parent = Player.Backpack
+	print("yes yes yes")
+	
+	if Fire == true then
+		task.delay(0.5, function()
+			InventoryService.Client.ItemAdded:Fire(Player, tool)
+		end)
+	end
+	
+	return true
+end
+
+--// Client Methods
+function InventoryService.Client:RequestItemEquip(player: Player, item: string)
+	local toolsFolder = ReplicatedStorage:FindFirstChild("Tools")
+	if not toolsFolder then error(false) end
+
+	local tool = toolsFolder:FindFirstChild(item)
+	if not tool then error(false) end
+
+	local data = EnsurePlayerData(player)
+	local itemType = tool:GetAttribute("Type")
+
+	if not itemType or not data.Items[item] then error(false) end
+
+	local correctType = if itemType == "Gun" then "EquippedGunSkin" elseif itemType == "Knife" then "EquippedKnifeSkin" else nil
+	if not correctType then error(false) end
+
+	if data[correctType] == item then return false end
+
+	data[correctType] = item
+	GetDataService():SaveData(player, correctType, item)
+	return true
+end
+
+--// Knit Lifecycle
+function InventoryService:KnitStart()
+	local ReadyEvent = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("ReadyEvent")
+
+	ReadyEvent.OnServerEvent:Connect(function(player)
+		if not table.find(ReadyPlayers, player) then
+			table.insert(ReadyPlayers, player)
+			EnsurePlayerData(player)
+			SendInformationToPlayer(player)
+		end
+	end)
+	
+	Players.PlayerRemoving:Connect(function(leavingPlayer)
+		if PlayerItemsTable[leavingPlayer] then
+			PlayerItemsTable[leavingPlayer] = nil
+		end
+		
+		if TradeCheckCount[leavingPlayer] then
+			TradeCheckCount[leavingPlayer] = nil
+		end
+		
+		local index = table.find(ReadyPlayers, leavingPlayer)
+		if index then table.remove(ReadyPlayers, index) end
+	end)
+end
+
+return InventoryService
