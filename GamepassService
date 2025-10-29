@@ -1,0 +1,85 @@
+--// Services
+local MarketplaceService = game:GetService("MarketplaceService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPlayer = game:GetService("StarterPlayer")
+
+--// Module Imports
+local Knit = require(ReplicatedStorage.Utilities.Packages.Knit)
+local Promise = require(ReplicatedStorage.Utilities.Promise)
+local Trove = require(ReplicatedStorage.Utilities.Trove)
+local InternalDatabase = require(script.InternalGamepassDatabase)
+
+--// Knit Initializer
+local GamepassService = Knit.CreateService{
+	Name = "GamepassService",
+}
+
+--// Knit functions
+function GamepassService:_GrantDeveloperProductReward(receiptInfo)
+	local purchased, failed = Enum.ProductPurchaseDecision.PurchaseGranted, Enum.ProductPurchaseDecision.NotProcessedYet
+	local player = Players:GetPlayerByUserId(receiptInfo.PlayerId)
+	if not player then return failed end
+
+	local productId = receiptInfo.ProductId
+	local success, productInfo = pcall(function()
+		return MarketplaceService:GetProductInfo(productId, Enum.InfoType.Product)
+	end)
+	
+	if not success and not productInfo then return failed end
+
+	-- // Get product's name & look up internal database for reward function
+	local productName = productInfo.Name
+	local productFunc = InternalDatabase.DeveloperProducts[productName]
+	
+	if productFunc then productFunc(player) return purchased end
+
+	-- else
+	return failed
+end
+
+function GamepassService:_GrantGamepassReward(player: Player, gamePassId: number)
+	local purchased, failed = Enum.ProductPurchaseDecision.PurchaseGranted, Enum.ProductPurchaseDecision.NotProcessedYet
+	local success, productInfo = pcall(function()
+		return MarketplaceService:GetProductInfo(gamePassId, Enum.InfoType.GamePass)
+	end)
+	
+	if not success and not productInfo then return failed end
+	
+	--// Look up the reward function by gamepass name
+	local gamepassName = productInfo.Name
+	local rewardFunc = InternalDatabase.Gamepasses[gamepassName]
+	if not rewardFunc then
+		return failed
+	end
+
+	local DataService = Knit.GetService("DataService")
+	DataService:SaveData(player, "Gamepasses", gamepassName, true)
+
+	-- Execute reward
+	local success, err = pcall(function()
+		rewardFunc(player)
+	end)
+
+	if not success then
+		return failed
+	end
+	
+	return purchased
+end
+
+
+function GamepassService:KnitStart()
+	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player, gamePassId, wasPurchased)
+		if wasPurchased then
+			self:_GrantGamepassReward(player, gamePassId)
+		end
+	end)
+
+	-- Handle Developer Products
+	MarketplaceService.ProcessReceipt = function(receiptInfo)
+		return self:_GrantDeveloperProductReward(receiptInfo)
+	end
+end
+
+return GamepassService
