@@ -1,0 +1,164 @@
+--[[
+   Example usage for reference:
+        local ObjectPool = require(ReplicatedStorage.Utilities.ObjectPool)
+        local pool = ObjectPool.new()
+
+        -- Initialize a pool of 20 buttons under the group "Back"
+        pool:Initiate(script.TemplateButton, 20, "Back")
+
+        -- Retrieve for use inside a ScrollingFrame
+        local buttons = pool:CheckoutGroup("Back", script.Parent.ScrollingFrame)
+        for _, btn in buttons do
+            btn.Text = "Option"
+        end
+
+        -- Return all active objects in that frame when done
+        pool:ReturnActive(script.Parent.ScrollingFrame)
+]]
+
+--// Module Imports
+local Promise = require(script.Promise)
+
+--// Services
+local ObjectPool = {}
+ObjectPool.__index = ObjectPool
+
+--// Types
+type PooledObject = Instance
+type GroupName = string
+type Config = {
+	Groups: {[GroupName]: {PooledObject}},
+	ActiveObjects: {[Instance]: {[GroupName]: {PooledObject}}},
+}
+
+--// Module Constructor
+function ObjectPool.new()
+	local self = setmetatable({}, ObjectPool)
+	self.Groups = {}
+	self.ActiveObjects = {}
+	return self
+end
+
+--// Methods
+--[[
+	Initiates the cloning of a template, for a specified amount, under a specified group.
+	Template: The object to clone
+	Amount: How many times to clone the temaplte
+	Group: The name of group the object will be under, used for tracking.
+]]
+function ObjectPool:Initiate(template: Instance, amount: number, group: GroupName)
+	return Promise.new(function(resolve)
+		if not template or typeof(template) ~= "Instance" then error("Invalid template instance provided to ObjectPool:Initiate") end
+		if typeof(amount) ~= "number" or amount < 0 then error("Amount must be greater than 0") end
+
+		self.Groups[group] = self.Groups[group] or {}
+
+		for i = 1, amount do
+			local clone = template:Clone()
+			clone.Name = `{template.Name}_{i}`
+			clone.Parent = nil
+			table.insert(self.Groups[group], clone)
+		end
+		resolve()
+	end)
+end
+
+--[[
+	Returns a single object from a group.
+	Group: The name of the group to retrieve an object from
+	Container: What to parent the object under. Will be parented to NIL if none is provided.
+]]
+function ObjectPool:GetObject(group: GroupName, container: Instance?): PooledObject?
+	local groupObjects = self.Groups[group]
+	if not groupObjects or #groupObjects == 0 then
+		return nil
+	end
+
+	local object = table.remove(groupObjects, 1)
+	if not object then return nil end
+
+	if container then
+		self.ActiveObjects[container] = self.ActiveObjects[container] or {}
+		self.ActiveObjects[container][group] = self.ActiveObjects[container][group] or {}
+		table.insert(self.ActiveObjects[container][group], object)
+		object.Parent = container
+	end
+
+	return object
+end
+
+
+--[[
+    Retrieves a group of pooled objects and assigns them as active under the given container.
+    Automatically returns any previously active objects in that container.
+]]
+function ObjectPool:CheckoutGroup(group: GroupName, container: Instance): {PooledObject}?
+	local groupObjects = self.Groups[group]
+	if not groupObjects or #groupObjects == 0 then return nil end
+
+	self:ReturnActive(container)
+
+	self.ActiveObjects[container] = self.ActiveObjects[container] or {}
+	self.ActiveObjects[container][group] = groupObjects
+
+	for _, object in groupObjects do
+		object.Parent = container
+	end
+
+	self.Groups[group] = {}
+	return groupObjects
+end
+
+--[[
+    Returns all currently active objects in a given container back into their respective pool groups.
+]]
+function ObjectPool:ReturnActive(container: Instance)
+	local active = self.ActiveObjects[container]
+	if not active then return end
+
+	for groupName, objects in table.clone(active) do
+		self.Groups[groupName] = self.Groups[groupName] or {}
+		for _, object in objects do
+			object.Parent = nil
+			table.insert(self.Groups[groupName], object)
+		end
+	end
+
+	self.ActiveObjects[container] = nil
+end
+
+--[[
+    Returns a single active object from a container or gruop back into its pool group.
+    Removes it from the ActiveObjects tracking table safely.
+    
+    Object: The instance that is to be retrieved.
+    Group: The group the object is in.
+    Container: The instance the object is parented to.
+]]
+function ObjectPool:ReturnObject(object: Instance, group: GroupName, container: Instance?)
+	-- If the object was tied to a container, remove it from tracking
+	if container and self.ActiveObjects[container] then
+		local activeGroup = self.ActiveObjects[container][group]
+		if activeGroup then
+			for i, pooledObject in ipairs(activeGroup) do
+				if pooledObject == object then
+					table.remove(activeGroup, i)
+					break
+				end
+			end
+			if #activeGroup == 0 then
+				self.ActiveObjects[container][group] = nil
+			end
+			if next(self.ActiveObjects[container]) == nil then
+				self.ActiveObjects[container] = nil
+			end
+		end
+	end
+
+	-- Return to pool
+	self.Groups[group] = self.Groups[group] or {}
+	object.Parent = nil
+	table.insert(self.Groups[group], object)
+end
+
+return ObjectPool
