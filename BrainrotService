@@ -1,0 +1,279 @@
+local PathfindingService = game:GetService("PathfindingService")
+local PhysicsService = game:GetService("PhysicsService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+local TweenService = game:GetService("TweenService")
+
+local Knit = require(ReplicatedStorage.Packages.Knit)
+local BrainrotsDB = require(ReplicatedStorage.Dictionary.BrainrotsDB)
+local PromiseModule = require(ReplicatedStorage.Util.PromiseModule)
+local GoodSignal = require(ReplicatedStorage.Util.GoodSignal)
+local TroveModule = require(ReplicatedStorage.Util.TroveModule)
+local ServerSignals = require(ServerScriptService.Modules.ServerSignals)
+
+local PlayerData: {[Player]: {CurrentlyCarryingBrainrot: Model, BaseBrainrots: {Model}, Base: Model}} = {}
+local RoamingBrainrots: {[Model]: {Name: string, Model: Model, Type: string, isBeingCarried: boolean}} = {}
+local ActivePaths = {}
+
+local MAX_DISTANCE_CLAIM_LIMIT = 5
+local ClaimedEvent = GoodSignal.new()
+
+local BrainrotService = Knit.CreateService{
+	Name = "BrainrotService",
+	Client = {
+		NewBrainrotAdded = Knit.CreateSignal(),
+		BrainrotRemoved = Knit.CreateSignal(),
+		BrainrotClaimed = Knit.CreateSignal()
+	},
+}
+
+--// Helper Functions
+local function RetrieveRandomBrainrot()
+	local totalchances = 0
+	for _, Brainrots in BrainrotsDB do
+		for _, Values in Brainrots do
+			totalchances += Values.Chance
+		end
+	end
+
+	local randomchance = math.random() * totalchances
+	local currentchance = 0
+
+	for Type, Brainrots in BrainrotsDB do
+		for name, Value in Brainrots do
+			currentchance += Value.Chance
+			if randomchance <= currentchance then
+				return Type, name
+			end
+		end
+	end
+end
+
+local function RetrieveRandomSpecificBrainrot(Type)
+	local totalchances = 0
+	for _, Value in BrainrotsDB do
+		totalchances += Value.Chance
+	end
+
+	local randomchance = math.random() * totalchances
+	local currentchance = 0
+
+	for name, Value in BrainrotsDB[Type] do
+		currentchance += Value.Chance
+		if randomchance <= currentchance then
+			return Type, name
+		end
+	end
+end
+
+local function WeldAllParts(Main, Model)
+	for _, Child:BasePart in Model:GetChildren() do
+		if Child:IsA("BasePart") == false then continue end
+		if Child == Main then continue end
+		
+		local weldConstraint = Instance.new("WeldConstraint")
+		weldConstraint.Parent = Main
+		
+		weldConstraint.Part0 = Main
+		weldConstraint.Part1 = Child
+	end
+end
+
+local function CalculatePath(HRP: BasePart, Destination: Vector3): (Path | boolean)
+	local Path = PathfindingService:CreatePath({
+		AgentRadius = 2,
+		AgentHeight = 5,
+		canJump = false,
+	})
+	Path:ComputeAsync(HRP.Position, Destination)
+	return (Path.Status == Enum.PathStatus.Success) and Path or false
+end
+
+local function FollowPath(Model: Model, Destination: Vector3, Player: Player?)
+	local BaseService = Knit.GetService("BaseService")
+	local BrainrotRootpart: BasePart = Model:FindFirstChild("HumanoidRootPart")
+	local Path = CalculatePath(BrainrotRootpart, Destination)
+
+	if typeof(Path) == "boolean" then
+		BrainrotService:RemoveBrainrot(Model)
+		return false
+	end
+	
+	PromiseModule.new(function(Resolve, Reject)
+		local Humanoid: Humanoid = Model:FindFirstChildOfClass("Humanoid")
+		if not Humanoid then return Reject() end
+
+		local canPathFind = true
+		local Connection
+		Connection = ClaimedEvent:Connect(function(target)
+			if target == Model then
+				canPathFind = false
+			end
+		end)
+
+		local wayPoints = Path:GetWaypoints()
+		for _, Point: PathWaypoint in wayPoints do
+			if not canPathFind then
+				Connection:Disconnect()
+				return Resolve({Action = "PickedUP", Brainrot = Model})
+			end
+			Humanoid:MoveTo(Point.Position)
+			Humanoid.MoveToFinished:Wait()
+		end
+
+		local Action = Player and "ReachedBase" or "ReachedEndPoint"
+		Connection:Disconnect()
+		Resolve({Action = Action, Brainrot = Model, Player = Player})
+	end)
+		:andThen(function(Args: {}) 
+			if Args then
+				if Args.Action == "ReachedBase" then
+					local Type = Model:GetAttribute("Type")
+					local Price = BrainrotsDB[Type][Model.Name].Price
+					
+					BaseService:AddBrainrotToBase(Args.Brainrot.Name, Player)
+					BrainrotService:RemoveBrainrot(Args.Brainrot)
+					
+					local Coins = Player.leaderstats.Coins
+					Coins.Value = math.clamp(Coins.Value - Price, 0, Coins.Value)
+					return true
+				end
+
+				if Args.Action == "ReachedEndPoint" then
+					BrainrotService:RemoveBrainrot(Args.Brainrot)
+					return true
+				end
+			end
+		end)
+end
+
+--// Service Methods
+
+function BrainrotService:SendBrainrotToBase(Player: Player, Brainrot: Model)
+	local Data = PlayerData[Player]
+	if not Data or not Data.Base then return false end
+
+	local basePoint: Vector3 = Data.Base:FindFirstChild("BasePoint").Position
+	task.delay(0.1, function()
+		FollowPath(Brainrot, basePoint, Player)
+	end)
+end
+
+function BrainrotService:RemoveBrainrot(Model: Model, Player: Player?)
+	RoamingBrainrots[Model] = nil
+	Model:Destroy()
+
+	if Player then
+		local Data = PlayerData[Player]
+		table.remove(Data.BaseBrainrots, Model)
+	end
+end
+
+function BrainrotService:SpawnBrainrot(Type: string, BrainrotName: string)
+	if not BrainrotsDB[Type] then return false end
+	local Data = BrainrotsDB[Type][BrainrotName]
+	if not Data then return false end
+
+	local Start = workspace.Map.Start.Position
+	local Destination = workspace.Map.End.Position
+
+	-- Clone and prepare model
+	local clonedModel: Model = Data.Model:Clone()
+	clonedModel:SetAttribute("Type", Type)
+
+	if not clonedModel.PrimaryPart then
+		return false
+	end
+
+	for _, part in clonedModel:GetDescendants() do
+		if part:IsA("BasePart") then
+			part.CollisionGroup = "Brainrot"
+
+			if part.Name == "HumanoidRootPart" then
+				part.CanCollide = true
+			else
+				part.CanCollide = false
+			end
+		end
+	end
+
+	local modelSize = clonedModel:GetExtentsSize()
+	local spawnCFrame = CFrame.new(Start + Vector3.new(0, modelSize.Y / 2 + 1, 0), Destination)
+	clonedModel:PivotTo(spawnCFrame)
+
+	WeldAllParts(clonedModel.PrimaryPart, clonedModel)
+	clonedModel.Parent = workspace.AvailableBrainrots
+
+	-- Fire event
+	BrainrotService.Client.NewBrainrotAdded:FireAll(clonedModel, Type, BrainrotName)
+
+	-- Register in RoamingBrainrots
+	RoamingBrainrots[clonedModel] = {
+		Name = clonedModel.Name,
+		Model = clonedModel,
+		isBeingCarried = false
+	}
+
+	-- Begin pathfinding
+	FollowPath(clonedModel, Destination)
+end
+
+function BrainrotService:InitiateBrainrotSpawnCycle(WAIT_TIME: number)
+	task.spawn(function()
+		while task.wait(WAIT_TIME) do
+			local Type, name = RetrieveRandomBrainrot()
+			warn(Type, name)
+			BrainrotService:SpawnBrainrot(Type, name)
+		end
+	end)
+end
+
+
+--// Function that handles stealing brainrot from a player's base.
+function BrainrotService.Client:ClaimBrainrot(Player: Player, RequestedBrainrot: Model)
+	local brainrotData = RoamingBrainrots[RequestedBrainrot]
+	if not brainrotData then return false end
+
+	local plrHRP = Player.Character.HumanoidRootPart
+	local rotHRP = RequestedBrainrot:FindFirstChild("HumanoidRootPart") or RequestedBrainrot.PrimaryPart
+	if not rotHRP then return false end
+
+	local Distance_Between_Them = (plrHRP.Position - rotHRP.Position).Magnitude
+	if Distance_Between_Them > MAX_DISTANCE_CLAIM_LIMIT then return false end
+
+	local Data = PlayerData[Player]
+	local leaderstats = Player:FindFirstChild("leaderstats")
+	if not leaderstats then return false end
+
+	Data.CurrentlyCarryingBrainrot = RequestedBrainrot
+	brainrotData.isBeingCarried = true
+
+	local Success = BrainrotService:SendBrainrotToBase(Player, RequestedBrainrot)
+	if Success then
+		Data.CurrentlyCarryingBrainrot = false
+	end
+
+	ClaimedEvent:Fire(RequestedBrainrot)
+	return true
+end
+
+--// Knit Start
+function BrainrotService:KnitStart()
+	local BaseService = Knit.GetService("BaseService")
+
+	ServerSignals.BaseRequestPlayerData:Connect(function(Player: Player)
+		local BaseData = BaseService:GetBaseData(Player)
+		PlayerData[Player] = {
+			CurrentlyCarryingBrainrot = false,
+			Base = BaseData.Base,
+			Brainrots_In_Base = BaseData.Brainrots_In_Base
+		}
+	end)
+
+	local WAIT_TIME = 5
+	BrainrotService:InitiateBrainrotSpawnCycle(WAIT_TIME)
+end
+
+return BrainrotService
