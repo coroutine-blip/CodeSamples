@@ -1,0 +1,418 @@
+--!strict
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContextActionService = game:GetService("ContextActionService")
+
+--// Player Context
+if RunService:IsServer() then return false end
+
+local Player = Players.LocalPlayer
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local Animator = Humanoid:FindFirstChildOfClass("Animator")
+
+--// Module Imports
+local Utilities = ReplicatedStorage:WaitForChild("Utilities")
+local Trove = require(Utilities.Trove)
+local Promise = require(Utilities.Promise)
+local Helper = require(script.Helper)
+local Fusion = require(Utilities.Fusion)
+
+--// Fusion Scope
+local myScope = Fusion.scoped({
+	Value = Fusion.Value,
+	Observer = Fusion.Observer,
+	Peek = Fusion.peek
+})
+
+--// Types
+export type AnimationConfiguration = {
+	RegisteredSets: {
+		[string]: { -- setName, e.g. "Rifle", "DefaultRig"
+			[string]: { -- animName, e.g. "Reload", "Shoot"
+				Id: string, -- Animation asset ID 
+				Priority: Enum.AnimationPriority?, -- Optional: Idle, Movement, Action, Core
+				Looped: boolean?, -- whether it loops
+				FadeTime: number?, -- Optional: default fade time
+				Speed: number?, -- Optional: default playback speed
+				Weight: number?, -- Optional: default blend weight
+				StopWhenMoving: boolean?,
+				ReturnWhenMovementStopped: boolean?,
+				Stops: {string}?, -- Optional: list of other anims to stop when this plays
+				OnEnded: (() -> ())?, -- Optional callback
+			}
+		}
+	},
+	LoadedAnimations: {
+		[string]: {
+			[string]: AnimationTrack
+		}
+	},
+	Connections: {[string]: RBXScriptConnection},
+	Animator: Animator,
+	MovementThreads: {[string]: thread},
+	PromiseThreads: {[string]: any},
+	KeyframeEvents: {[string]: RBXScriptConnection},
+	FusionScopes: {[string]: Fusion.Scope}
+}
+
+--// Main Module
+local AnimationSystemService = {}
+AnimationSystemService.__index = AnimationSystemService
+export type ConfiguredAnimSystem = typeof(setmetatable({} :: AnimationConfiguration, AnimationSystemService))
+
+--// Helper Functions
+local function CreateScope(self: ConfiguredAnimSystem, setName)
+	self.FusionScopes[setName] = Fusion.scoped({
+		Value = Fusion.Value,
+		Observer = Fusion.Observer
+	}) :: Fusion.Scope
+	return self.FusionScopes[setName]
+end
+
+local function AnimationPlaybackHelper(self, SetName, AnimTable: {[string]: AnimationTrack}, StopAnimations: boolean)
+	return Promise.new(function(resolve, reject, onCancel)
+		onCancel = function()
+			return reject()			
+		end
+
+		if StopAnimations then
+			for _, animationName in AnimTable do
+				self:Stop(SetName, animationName)
+			end
+		elseif not StopAnimations then
+			for _, animationName in AnimTable do
+				self:Play(SetName, animationName)
+			end
+		end
+
+		resolve()
+	end)
+end
+
+local function CountRegisteredSets(self, SetName): boolean | number
+	local RegisteredSets = self.RegisteredSets
+	if not RegisteredSets[SetName] then return false end
+
+	local n = 0
+	for _, _ in RegisteredSets[SetName] do
+		n += 1
+	end	
+	return n
+end
+
+--// Constructor
+function AnimationSystemService.New(): ConfiguredAnimSystem
+	local self = setmetatable({} :: AnimationConfiguration, AnimationSystemService) 
+	self.RegisteredSets = {}
+	self.LoadedAnimations = {}
+	self.Connections = {}
+	self.Animator = Animator :: Animator
+	self.MovementThreads = {}
+	self.PromiseThreads = {}
+	self.FusionScopes = {}
+	self.KeyframeEvents = {}
+	self:StartCleanupOperation()
+	return self
+end
+
+--// Public Methods
+function AnimationSystemService:RegisterSet(SetName: string, Animations: {[string]: {[string]: string}}): boolean | {}
+	if typeof(SetName) ~= "string" or typeof(Animations) ~= "table" then return false end
+	if next(Animations) == nil then return false end
+	if self.RegisteredSets[SetName] then
+		return false
+	end
+
+	self.RegisteredSets[SetName] = Animations
+	return true, self.RegisteredSets[SetName]
+end
+
+function AnimationSystemService:Play(SetName: string, AnimationName: string): boolean
+	if typeof(SetName) ~= "string" or typeof(AnimationName) ~= "string" then
+		return false
+	end
+
+	local LoadedAnims = self.LoadedAnimations
+	local track: AnimationTrack? = LoadedAnims[SetName] and LoadedAnims[SetName][AnimationName]
+	if not track then 
+		track = self:LoadAnimation(SetName, AnimationName)
+	end
+
+	local registeredConfig: {Stops: {[string]: string}, StopWhenMoving: boolean} = self.RegisteredSets[SetName][AnimationName]
+	if registeredConfig then
+		if registeredConfig.StopWhenMoving and Player.Character.Humanoid.MoveDirection.Magnitude > 0 then
+			return false
+		end
+
+		track = Helper:SetAppropriateTrackSettings(track, registeredConfig)
+
+		if registeredConfig.Stops then
+			for stopSetName, stopName in registeredConfig.Stops do
+				local otherTrack: AnimationTrack? = LoadedAnims[stopSetName] and LoadedAnims[stopSetName][stopName]
+				if otherTrack and otherTrack.IsPlaying then
+					otherTrack:Stop(0.1)
+				end
+			end
+		end
+	end
+	track:Play(registeredConfig.FadeTime or 0.1, registeredConfig.Weight or 1, registeredConfig.Speed or 1)
+	return true
+end
+
+function AnimationSystemService:Stop(SetName: string, AnimationName: string)
+	if typeof(SetName) ~= "string" or typeof(AnimationName) ~= "string" then
+		return false
+	end
+
+	local track: AnimationTrack? = self.LoadedAnimations[SetName][AnimationName]
+	if not track then error(`Track: {AnimationName} for: {SetName} does not exist!`) end
+
+	track:Stop(0.1)
+	return true
+end
+
+function AnimationSystemService:StopAll(SetName: string)
+	if typeof(SetName) ~= "string" then
+		return false
+	end
+
+	local Animations: {AnimationTrack}? = self.LoadedAnimations[SetName]
+	if not Animations then return false end
+	for _, anim: AnimationTrack in Animations do
+		anim:Stop(0.1)
+	end
+
+	return true
+end
+
+function AnimationSystemService:UnRegisterAnimationSet(SetName)
+	if typeof(SetName) ~= "string" then
+		warn("[AnimationSystemService] UnregisterAnimationSet failed: SetName must be a string.")
+		return false
+	end
+
+	if not self.RegisteredSets[SetName] then
+		warn(`[AnimationSystemService] UnregisterAnimationSet failed: "{SetName}" is not registered.`)
+		return false
+	end
+
+	--// Stop all animations in that set if any are playing
+	if self.LoadedAnimations[SetName] then
+		for _, track in self.LoadedAnimations[SetName] do
+			if track.IsPlaying then
+				track:Stop(0)
+			end
+		end
+		self.LoadedAnimations[SetName] = nil
+	end
+
+	local movementThread = self.MovementThreads[SetName]
+	local movementConnection = self.Connections[SetName]
+	local promiseThread = self.PromiseThreads[SetName]
+	local keyframeEvents = self.KeyframeEvents[SetName]
+
+	
+	if movementThread then
+		coroutine.close(movementThread)
+		self.MovementThreads[SetName] = nil
+	end
+
+	if movementConnection then
+		movementConnection:Disconnect()
+		self.Connections[SetName] = nil
+	end
+
+	if promiseThread and promiseThread:getStatus() == "Playing" then
+		promiseThread:cancel()
+		self.PromiseThreads[SetName] = nil
+	end
+
+	
+	if keyframeEvents then
+		for _, tables in keyframeEvents do
+			for _, connection: RBXScriptConnection in tables do
+				connection:Disconnect()
+			end
+		end
+	end
+	table.clear(self.KeyframeEvents[SetName])	
+
+	self.RegisteredSets[SetName] = nil
+	return true
+end
+
+function AnimationSystemService:UnbindKeyframeEvent(SetName, AnimationName, KeyframeName)
+	local KeyframeEvents = self.KeyframeEvents
+	if KeyframeEvents[SetName][AnimationName][KeyframeName] then
+		KeyframeEvents[SetName][AnimationName][KeyframeName]:Disconnect()
+		KeyframeEvents[SetName][AnimationName][KeyframeName] = nil
+	end
+end
+
+function AnimationSystemService:BindToKeyframeEvent(SetName, AnimationName, KeyframeName, callback: () -> ())
+	if typeof(SetName) ~= "string" or typeof(AnimationName) ~= "string" or typeof(KeyframeName) ~= "string" then
+		return
+	end
+
+	local LoadedAnimations = self.LoadedAnimations
+	local animationTrack: AnimationTrack = LoadedAnimations[SetName] 
+		and LoadedAnimations[SetName][AnimationName] or self:LoadAnimation(SetName, AnimationName)
+
+	self.KeyframeEvents[SetName] = self.KeyframeEvents[SetName] or {}
+	self.KeyframeEvents[SetName][AnimationName] = self.KeyframeEvents[SetName][AnimationName] or {}
+
+	local KeyframeEvents = self.KeyframeEvents
+
+	-- Prevent duplicate connections
+	if KeyframeEvents[SetName][AnimationName][KeyframeName] then
+		return
+	end
+
+	KeyframeEvents[SetName][AnimationName][KeyframeName] =
+		animationTrack:GetMarkerReachedSignal(KeyframeName):Connect(function(reachedFrameName)
+			callback()
+		end)
+end
+
+
+function AnimationSystemService:StopAnimationsWhenMoving(SetName)
+	local TABLESIZE = CountRegisteredSets(self, SetName)
+	if typeof(TABLESIZE) ~= "number" then return end
+
+	local Character = Player.Character
+	if not Character then return end
+
+	local Humanoid = Character:FindFirstChildOfClass("Humanoid") :: Humanoid
+	if not Humanoid then return end
+
+	local LoadedAnimations = self.LoadedAnimations
+	local animationsToStop = table.create(TABLESIZE)
+	local animationsToReturnPlaying = table.create(TABLESIZE)
+
+	for animationName, values in self.RegisteredSets[SetName] do
+		if values.StopWhenMoving == true then
+			table.insert(animationsToStop, animationName)
+		end
+
+		if values.ReturnWhenMovementStopped == true then
+			table.insert(animationsToReturnPlaying, animationName)
+		end		
+	end
+
+	local myScope = self.FusionScopes[SetName]
+	if not myScope then myScope = CreateScope(self, SetName) end
+
+	local isMovingValue = myScope:Value(nil)
+	local observer = myScope:Observer(isMovingValue)
+
+	local toDisconnect = observer:onChange(function()
+		local isMovingValue = Fusion.peek(isMovingValue)
+		local thread = self.PromiseThreads[SetName]
+		local isPromiseRunning = thread and thread:getStatus()
+
+		if isPromiseRunning and isPromiseRunning == "Started" then thread:cancel() end
+		if isMovingValue == true then
+			if self.LoadedAnimations[SetName] then
+				self.PromiseThreads[SetName] = AnimationPlaybackHelper(self, SetName, animationsToStop, true)
+			end
+		end
+
+		if isMovingValue == false then
+			if self.LoadedAnimations[SetName] then
+				self.PromiseThreads[SetName] = AnimationPlaybackHelper(self, SetName, animationsToReturnPlaying, false)
+			end
+		end
+	end)
+
+	if self.MovementThreads[SetName] then
+		coroutine.close(self.MovementThreads[SetName])
+		self.Connections[SetName]:Disconnect()
+	end
+
+	self.MovementThreads[SetName] = coroutine.wrap(function()
+		local hasSetValue = true
+		self.Connections[SetName] = RunService.Heartbeat:Connect(function()
+			if not hasSetValue and Humanoid.MoveDirection.Magnitude > 0 then
+				hasSetValue = true
+				isMovingValue:set(true)
+
+			elseif hasSetValue and Humanoid.MoveDirection.Magnitude <= 0 then
+				hasSetValue = false
+				isMovingValue:set(false)
+			end
+		end)
+	end)()
+end
+
+--// Public helper Methods
+function AnimationSystemService:LoadAnimation(SetName: string, AnimationName: string): boolean | AnimationTrack
+	if typeof(SetName) ~= "string" or typeof(AnimationName) ~= "string" then
+		return false
+	end
+
+	self.LoadedAnimations[SetName] = self.LoadedAnimations[SetName] or {}
+	if self.LoadedAnimations[SetName][AnimationName] then
+		return true, self.LoadedAnimations[SetName][AnimationName]
+	end
+
+	local registeredConfig = self.RegisteredSets[SetName] and self.RegisteredSets[SetName][AnimationName]
+	if not registeredConfig then error(`"{AnimationName}" does not have a registered configuration (Is not registered)`) end
+
+	local Id: string? = registeredConfig.Id
+	if not Id then error(`No Animation ID for: {AnimationName} has been found.`) end
+
+	local Animator: Animator? = self.Animator
+	if not Animator then error(`Animator not found when attempting to play {AnimationName}`) end
+
+	local animInstance = Instance.new("Animation")
+	animInstance.AnimationId = Id
+
+	local Track: AnimationTrack = Animator:LoadAnimation(animInstance)
+	self.LoadedAnimations[SetName][AnimationName] = Track
+
+	return Track
+end
+
+function AnimationSystemService:StartCleanupOperation()
+	Player.CharacterAdded:Connect(function(Char)
+		--// Clear movement threads
+		for _, promise in self.PromiseThreads do
+			if promise:getStatus() == "Started" then promise:cancel() end
+		end	
+		table.clear(self.PromiseThreads)
+
+		for _, thread in self.MovementThreads do
+			if coroutine.status(thread) ~= "dead" then
+				coroutine.yield(thread)
+				coroutine.close(thread)
+			end
+		end
+		table.clear(self.MovementThreads)
+
+		-- // Clear all conns
+		for _, conn in self.Connections do
+			conn:Disconnect()
+		end
+		table.clear(self.Connections)
+
+		--// Clear loaded animations
+		for setName, setTracks in self.LoadedAnimations do
+			for _, track in pairs(setTracks) do
+				if track.IsPlaying then
+					track:Stop(0)
+				end
+			end
+		end
+		table.clear(self.LoadedAnimations)
+
+		local Humanoid: Humanoid = Char:WaitForChild("Humanoid")
+		local Animator = Humanoid:FindFirstChildOfClass("Animator") 
+		if not Animator then return end
+
+		self.Animator = Animator
+	end)
+end
+
+return AnimationSystemService
